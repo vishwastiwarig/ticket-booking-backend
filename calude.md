@@ -1,0 +1,72 @@
+# Project: Seat-based Ticket Booking System (production-grade backend)
+
+## Goal
+Build a production-quality backend for booking seats at shows (movies/events).
+The core problem is correctness under concurrency: two users must never get the
+same seat, and money must never be lost or double-charged. Treat this as a real
+service, not a demo — tests, migrations, CI, observability, and docs are part of
+the deliverable.
+
+## Stack (fixed — don't substitute)
+- Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.0 (async), Alembic
+- PostgreSQL (source of truth for seat state), Redis (cache, rate limits, queue broker)
+- Celery or ARQ for background jobs (hold expiry, ticket generation, emails)
+- Payments: Razorpay (test mode) with real signed webhooks
+- pytest + testcontainers (real Postgres/Redis in tests), Ruff, mypy --strict, pre-commit
+- Docker Compose for local dev, GitHub Actions for CI, OpenTelemetry for tracing
+- Structured JSON logging with request IDs propagated into workers
+
+## Architecture
+Modular monolith — one FastAPI app + one worker process. Packages:
+`inventory/`, `bookings/`, `payments/`, `notifications/`, `core/` (db, config, auth).
+No microservices. Cross-module calls go through service-layer interfaces, not direct
+model imports.
+
+## Domain model
+Event → Show (event + venue + start_time)
+Venue → Section → Seat
+SeatInventory (show_id, seat_id, status: AVAILABLE|HELD|BOOKED, held_by, hold_expires_at)
+  - UNIQUE(show_id, seat_id), CHECK on status
+Booking (user_id, show_id, status: PENDING|CONFIRMED|CANCELLED|EXPIRED, idempotency_key UNIQUE)
+BookingSeat (booking_id, seat_inventory_id)
+Payment (booking_id, provider_ref UNIQUE, amount, status)
+OutboxEvent (for reliable event publishing — no dual writes)
+
+## Critical flows
+1. Hold: POST /shows/{id}/holds {seat_ids, idempotency_key}
+   Single transaction: conditional UPDATE seat_inventory SET status='HELD', held_by, 
+   hold_expires_at=now()+10min WHERE show_id=? AND seat_id IN (?) AND status='AVAILABLE'.
+   If rowcount != len(seat_ids) → rollback, 409 listing the seats that failed.
+   No SELECT-then-UPDATE. No Redis locks for correctness.
+2. Pay: POST /bookings/{id}/pay → create provider order, return client payload.
+3. Webhook: verify signature → idempotent (return 200 if already CONFIRMED) →
+   transaction: seats HELD→BOOKED, booking→CONFIRMED only if booking still PENDING →
+   write OutboxEvent. If booking already EXPIRED → auto-refund, log it.
+4. Expiry job (every 30s): seats back to AVAILABLE and booking→EXPIRED where
+   status='HELD' AND hold_expires_at < now().
+5. Seat map read: served from Redis cache (short TTL), invalidated on any write.
+
+## Non-negotiables
+- Every mutating endpoint accepts an idempotency key.
+- Webhooks are at-least-once; handlers must be idempotent.
+- A concurrency test exists from day one: N concurrent hold requests for the same
+  seats on real Postgres → assert exactly one succeeds per seat, zero duplicates.
+- Every bug found becomes a regression test.
+- Per-user and per-IP rate limiting at the API layer.
+- Record architecture decisions in docs/decisions/ (ADR format) — e.g. why conditional
+  UPDATE over FOR UPDATE / Redis locks, why 10-min hold, why outbox pattern.
+
+## Build order
+1. Repo skeleton, Docker Compose, schema + migrations, health endpoint, CI green, 
+   failing concurrency test.
+2. Venue/show/seat CRUD + cached seat-map endpoint.
+3. Hold flow → make concurrency test pass → expiry job.
+4. Payments + webhooks + idempotency + late-payment refund edge case.
+5. Ticket generation (QR/PDF), email via worker, cancellation with refund rules.
+6. Waiting-room queue (Redis), load test (Locust) for the same-50-seats scenario,
+   observability dashboards, README with measured numbers.
+
+## Working style
+Work in small, reviewable steps. Before implementing a flow, state the plan and
+the tests you'll write. Prefer boring, well-understood solutions. Ask before adding
+a dependency not listed above. Don't build a frontend unless asked.
